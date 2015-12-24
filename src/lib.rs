@@ -6,6 +6,9 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+// TODO: add quickcheck tests
+// TODO: add benchmarks
+
 /*!
 This crate implements a simple and fast algorithm for building and refining a partition of the set
 `[0usize, n)`. The most important type is `Partition` and its most important function is `refine`,
@@ -27,18 +30,20 @@ let result: &[&[usize]] = &[&[0, 1, 2, 3], &[4, 5, 6]];
 assert_eq!(&part.iter().collect::<Vec<_>>()[..], result);
 
 part.refine(&[3, 4, 5]);
-// Note that the order of the sets is not defined (although each individual set is guaranteed to be
-// sorted), so this assert is not really kosher.
-let result: &[&[usize]] = &[&[3], &[4, 5], &[0, 1, 2], &[6]];
-assert_eq!(&part.iter().collect::<Vec<_>>()[..], result);
+{
+    let mut result: Vec<_> = part.iter().collect();
+    result.sort(); // The order of sets isn't defined, so we need to sort it before comparing.
+    let expected: &[&[usize]] = &[&[1, 2, 0], &[3], &[4, 5], &[6]];
+    assert_eq!(&result[..], expected);
+}
 
 // Refine it again, and this time print out some information each time a set gets split.
-let alert = |original: &[usize], parts: (&[usize], &[usize])| {
-    println!("splitting {:?} into {:?} and {:?}", original, parts.0, parts.1);
+let alert = |p: &Partition, intersection: usize, difference: usize| {
+    println!("splitting {:?} from {:?}", p.part(intersection), p.part(difference));
 };
 // This should print:
-//     splitting [0, 1, 2] into [2] and [0, 1]
-//     splitting [4, 5] into [4] and [5]
+//     splitting [2] from [0, 1]
+//     splitting [4] from [5]
 // Note that it doesn't say anything about splitting [3] into [3] because that isn't interesting.
 part.refine_with_callback(&[2, 3, 4], alert);
 ```
@@ -51,8 +56,9 @@ part.refine_with_callback(&[2, 3, 4], alert);
         unstable_features,
         unused_import_braces, unused_qualifications)]
 
+use std::collections::HashSet;
 use std::fmt::{Debug, Error, Formatter};
-use std::{mem, usize};
+use std::usize;
 
 /// A partition of a set of `usize`s. See the crate documentation for more information.
 #[derive(Clone)]
@@ -60,16 +66,21 @@ pub struct Partition {
     // Contains the numbers 0..n in some order.
     elts: Vec<usize>,
     // A list of non-overlapping ranges. If `partition[i] = (j, k)` then the `i`th set in our
-    // partition is `elts[j..k]`. We maintain the invariant that `elts[j..k]` is sorted.
+    // partition is `elts[j..k]`.
     partition: Vec<(usize, usize)>,
     // If `rev_partition[i] == j` then `i` is in the `j`th set of our partition.
     rev_partition: Vec<usize>,
+    // If `rev_elts[i] == j` then `elts[j] = i`.
+    rev_elts: Vec<usize>,
 
     // Some extra space that we allocate up front so that we don't need to allocate in our inner
-    // loop.
-    intersection: Vec<usize>,
-    difference: Vec<usize>,
-    active_sets: Vec<usize>,
+    // loop. These are all modified during refinement.
+
+    // This stores indices of all parts that intersect with the set we are currently refining with.
+    active_sets: HashSet<usize>,
+    // For every index in `active_sets`, this stores an index into elts. It points to the first
+    // element in the difference between the refining set and the part.
+    diff_start: Vec<usize>,
 }
 
 /// An iterator over the sets in a `Partition`.
@@ -94,9 +105,9 @@ impl Partition {
             elts: Vec::with_capacity(size),
             partition: Vec::with_capacity(size),
             rev_partition: vec![usize::MAX; size],
-            intersection: Vec::with_capacity(size),
-            difference: Vec::with_capacity(size),
-            active_sets: Vec::with_capacity(size),
+            rev_elts: vec![usize::MAX; size],
+            active_sets: HashSet::with_capacity(size),
+            diff_start: vec![usize::MAX; size],
         };
 
         for set in sets {
@@ -110,13 +121,10 @@ impl Partition {
                 } else {
                     ret.elts.push(item);
                     ret.rev_partition[item] = set_idx;
+                    ret.rev_elts[item] = ret.elts.len() - 1;
                 }
             }
             ret.partition.push((set_start, ret.elts.len()));
-        }
-
-        for &(start, end) in &ret.partition {
-            ret.elts[start..end].sort();
         }
 
         ret
@@ -128,75 +136,17 @@ impl Partition {
             elts: (0..size).into_iter().collect(),
             partition: vec![(0, size)],
             rev_partition: vec![0; size],
-            intersection: Vec::with_capacity(size),
-            difference: Vec::with_capacity(size),
-            active_sets: Vec::with_capacity(size),
+            rev_elts: (0..size).into_iter().collect(),
+            active_sets: HashSet::with_capacity(size),
+            diff_start: vec![usize::MAX; size],
         }
     }
 
-    /// Iterates over the sets in this partition, each of which is realized by a sorted `&[usize]`.
+    /// Iterates over the sets in this partition, each of which is realized by a `&[usize]`.
     pub fn iter<'a>(&'a self) -> PartitionIter<'a> {
         PartitionIter {
             next_set_idx: 0,
             partition: self,
-        }
-    }
-
-    // Refines a single set (the one indexed by `set_idx`).
-    fn refine_one<F>(&mut self, refiner: &[usize], set_idx: usize, cb: &mut F)
-    where F: FnMut(&[usize], (&[usize], &[usize])) {
-        self.intersection.clear();
-        self.difference.clear();
-
-        let (start, end) = self.partition[set_idx];
-        { // Scope for `iter`, so that we don't borrow `self.elts` for too long.
-            let mut iter = self.elts[start..end].iter().cloned().peekable();
-            let mut last_refiner = 0usize;
-            for &next_refiner in refiner {
-                if next_refiner < last_refiner {
-                    panic!("`refiner` must be sorted, but got {:?}", refiner);
-                }
-
-                // Every element strictly smaller than `next_refiner` goes into the difference. If
-                // we find something equal to `next_refiner`, put in in the intersection.
-                while let Some(&x) = iter.peek() {
-                    if x < next_refiner {
-                        self.difference.push(x);
-                    } else if x == next_refiner {
-                        self.intersection.push(x);
-                    } else {
-                        break;
-                    }
-                    iter.next();
-                }
-                last_refiner = next_refiner;
-            }
-
-            // Everything after the last element of `refiner` goes into the difference.
-            self.difference.extend(iter);
-        }
-
-        // If the refinement was non-trivial, call the callback and update the partition.
-        if !self.intersection.is_empty() && !self.difference.is_empty() {
-            cb(&self.elts[start..end], (&self.intersection[..], &self.difference[..]));
-
-            let mid = start + self.intersection.len();
-            debug_assert!(mid + self.difference.len() == end);
-
-            self.partition[set_idx].1 = mid;
-            self.partition.push((mid, end));
-
-            // TODO: once we have a stable way of copying slices, use that.
-            for (i, &x) in self.intersection.iter().enumerate() {
-                self.elts[start + i] = x;
-            }
-            for (i, &x) in self.difference.iter().enumerate() {
-                self.elts[mid + i] = x;
-            }
-
-            for &x in self.difference.iter() {
-                self.rev_partition[x] = self.partition.len() - 1;
-            }
         }
     }
 
@@ -205,14 +155,23 @@ impl Partition {
     /// Every set `s` in the partition is replaced by `s.intersection(refiner)` and
     /// `s.difference(refiner)`.
     ///
-    /// This function runs in time that is O(n log n) in the size of `refiner`, which must be
-    /// sorted.
+    /// This function runs in time that is O(n log n) in the size of `refiner`.
     ///
     /// # Panics
     ///  - if `refiner` contains any elements that are not in the partition
-    ///  - if `refiner` is not sorted
-     pub fn refine(&mut self, refiner: &[usize]) {
-        self.refine_with_callback(refiner, |_, _| {});
+    pub fn refine(&mut self, refiner: &[usize]) {
+        self.refine_with_callback(refiner, |_, _, _| {});
+    }
+
+    /// Returns one part of this partition.
+    pub fn part(&self, part_idx: usize) -> &[usize] {
+        let (start, end) = self.partition[part_idx];
+        &self.elts[start..end]
+    }
+
+    /// The number of parts in this partition.
+    pub fn num_parts(&self) -> usize {
+        self.partition.len()
     }
 
     /// Refines the partition with the given set.
@@ -220,37 +179,54 @@ impl Partition {
     /// Every set `s` in the partition is replaced by `s.intersection(refiner)` and
     /// `s.difference(refiner)`. Every time we make such a non-trivial (meaning that both the
     /// intersection and the difference are non-empty) replacement, we call the supplied callback
-    /// function with arguments `original_set` and `(intersection, difference)`.
+    /// function with arguments `self`, `original_set_idx` and `difference_idx`.
     ///
-    /// This function runs in time that is O(n log n) in the size of `refiner`, which must be
-    /// sorted.
+    /// This function runs in time that is O(n log n) in the size of `refiner`.
     ///
     /// # Panics
     ///  - if `refiner` contains any elements that are not in the partition
-    ///  - if `refiner` is not sorted
     pub fn refine_with_callback<F>(&mut self, refiner: &[usize], mut split_callback: F)
-    where F: FnMut(&[usize], (&[usize], &[usize])) {
-        // Find the indices of all sets that we need to touch. This is key to being fast, because
-        // it means we don't need to iterate over all sets in our partition.
+    where F: FnMut(&Partition, usize, usize) {
         self.active_sets.clear();
         for &x in refiner.iter() {
             if x >= self.rev_partition.len() {
                 panic!("`refiner` went out of bounds: {:?}", refiner);
             }
-            self.active_sets.push(self.rev_partition[x]);
-        }
-        self.active_sets.sort();
-        self.active_sets.dedup();
+            let part_idx = self.rev_partition[x];
+            if self.active_sets.insert(part_idx) {
+                // We start out saying that everything is in the difference (part \ refiner).
+                self.diff_start[part_idx] = self.partition[part_idx].0;
+            }
 
-        // Swap out `self.active_sets` temporarily, so that we can iterate over it and modify
-        // `self` without the borrow checker flipping out. I'm pretty sure this doesn't allocate.
-        let mut tmp = Vec::new();
-        mem::swap(&mut tmp, &mut self.active_sets);
+            let old_x_idx = self.rev_elts[x];
+            let old_y_idx = self.diff_start[part_idx];
+            let y = self.elts[old_y_idx];
+            self.elts.swap(old_x_idx, old_y_idx);
+            self.diff_start[part_idx] += 1;
 
-        for &set_idx in &tmp {
-            self.refine_one(refiner, set_idx, &mut split_callback);
+            self.rev_elts[x] = old_y_idx;
+            self.rev_elts[y] = old_x_idx;
         }
-        mem::swap(&mut tmp, &mut self.active_sets);
+
+        // Go over the active sets and see which of them were actually split non-trivially.
+        for &part_idx in &self.active_sets {
+            let (start, end) = self.partition[part_idx];
+            let diff_start = self.diff_start[part_idx];
+
+            if diff_start != start && diff_start != end {
+                // There was a non-trivial split. The intersection is in [start, diff_start). The
+                // difference is in [diff_start, end).
+                self.partition[part_idx] = (start, diff_start);
+                self.partition.push((diff_start, end));
+                for elt_idx in diff_start..end {
+                    let elt = self.elts[elt_idx];
+                    self.rev_partition[elt] = self.partition.len() - 1;
+                    self.rev_elts[elt] = elt_idx;
+                }
+
+                split_callback(self, part_idx, self.partition.len() - 1);
+            }
+        }
     }
 }
 
@@ -297,6 +273,15 @@ impl<'a> IntoIterator for &'a Partition {
 mod tests {
     use super::*;
 
+    fn check_sanity(part: &Partition) {
+        for (elt_idx, &elt) in part.elts.iter().enumerate() {
+            assert_eq!(part.rev_elts[elt], elt_idx);
+            let part_idx = part.rev_partition[elt];
+            let (start, end) = part.partition[part_idx];
+            assert!(start <= elt_idx && elt_idx < end);
+        }
+    }
+
     fn make(sets: &[&[usize]], size: usize) -> Partition {
         Partition::new(sets.iter().map(|set| set.iter().cloned()), size)
     }
@@ -327,28 +312,24 @@ mod tests {
     #[test]
     fn test_refine() {
         let mut part = Partition::simple(5);
-        part.refine_with_callback(&[1, 3, 4], |orig, (int, diff)| {
-            assert_eq!(orig, &[0, 1, 2, 3, 4]);
-            assert_eq!(int, &[1, 3, 4]);
-            assert_eq!(diff, &[0, 2]);
+        part.refine_with_callback(&[1, 3, 4], |p, orig, new| {
+            assert_eq!(p.part(orig), &[1, 3, 4]);
+            assert_eq!(p.part(new), &[0, 2]);
         });
-        part.refine_with_callback(&[1], |orig, (int, diff)| {
-            assert_eq!(orig, &[1, 3, 4]);
-            assert_eq!(int, &[1]);
-            assert_eq!(diff, &[3, 4]);
+        check_sanity(&part);
+        part.refine_with_callback(&[1], |p, orig, new| {
+            assert_eq!(p.part(orig), &[1]);
+            assert_eq!(p.part(new), &[3, 4]);
         });
+        check_sanity(&part);
 
         let mut times_called = 0usize;
-        part.refine_with_callback(&[0, 2], |_, _| { times_called += 1; });
+        part.refine_with_callback(&[0, 2], |_, _, _| { times_called += 1; });
         assert_eq!(times_called, 0);
-        part.refine_with_callback(&[0, 3], |_, _| { times_called += 1; });
+        check_sanity(&part);
+        part.refine_with_callback(&[0, 3], |_, _, _| { times_called += 1; });
         assert_eq!(times_called, 2);
-    }
-
-    #[test]
-    #[should_panic]
-    fn rest_refine_panics_on_unsorted() {
-        Partition::simple(5).refine(&[3, 2, 1]);
+        check_sanity(&part);
     }
 
     #[test]
