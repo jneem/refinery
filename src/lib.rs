@@ -191,7 +191,10 @@ impl Partition {
         for &x in refiner.iter() {
             if x >= self.rev_partition.len() {
                 panic!("`refiner` went out of bounds: {:?}", refiner);
+            } else if self.rev_partition[x] == usize::MAX {
+                panic!("`refiner contained an element ({:?}) that wasn't in the initial partition", x);
             }
+
             let part_idx = self.rev_partition[x];
             if self.active_sets.insert(part_idx) {
                 // We start out saying that everything is in the difference (part \ refiner).
@@ -336,5 +339,12 @@ mod tests {
     #[should_panic]
     fn rest_refine_panics_on_out_of_bounds() {
         Partition::simple(5).refine(&[1, 5]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn rest_refine_panics_on_invalid_elt() {
+        let mut part = make(&[&[0, 1, 2, 4]], 5);
+        part.refine(&[0, 3]);
     }
 }
