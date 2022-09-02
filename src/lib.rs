@@ -169,6 +169,18 @@ impl Partition {
         &self.elts[start..end]
     }
 
+    /// Get the index of the part containing the given element.
+    ///
+    /// # Panics
+    ///  - if `element` is not in the partition
+    pub fn find(&self, element: usize) -> usize {
+        let i = self.rev_partition[element];
+        if i == usize::MAX {
+            panic!("`element` is not in the partition");
+        }
+        i
+    }
+
     /// The number of parts in this partition.
     pub fn num_parts(&self) -> usize {
         self.partition.len()
@@ -346,5 +358,28 @@ mod tests {
     fn rest_refine_panics_on_invalid_elt() {
         let mut part = make(&[&[0, 1, 2, 4]], 5);
         part.refine(&[0, 3]);
+    }
+
+    #[test]
+    fn test_find() {
+        let p = make(&[&[0,1,4], &[2]], 5);
+        assert_eq!(p.find(0), 0);
+        assert_eq!(p.find(1), 0);
+        assert_eq!(p.find(2), 1);
+        assert_eq!(p.find(4), 0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_find_panics_on_out_of_bounds() {
+        let p = make(&[&[0,1,4], &[2]], 5);
+        p.find(5);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_find_panics_on_excluded_element() {
+        let p = make(&[&[0,1,4], &[2]], 5);
+        p.find(3);
     }
 }
